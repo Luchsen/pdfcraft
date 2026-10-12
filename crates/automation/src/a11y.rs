@@ -4,6 +4,7 @@ use pdfcraft_engine::DocId;
 use pdfcraft_engine::a11y::{Category, Options, Report, Rule, Status};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 
 use crate::{Args, Automation, Result, ToolError, child, failed, unused, write_atomic};
 
@@ -56,6 +57,81 @@ pub(crate) fn report_json(r: &Report) -> Value {
         "skipped": r.count(Status::Skipped),
         "results": results,
     })
+}
+
+fn review_hash(bytes: &[u8]) -> String {
+    Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn review_decisions(value: &Value, pages: usize) -> Result<Vec<Value>> {
+    let rows = value.as_array().ok_or_else(|| ToolError::InvalidArgs("decisions must be an array".into()))?;
+    let mut seen = BTreeSet::new();
+    rows.iter()
+        .map(|row| {
+            let fields = row.as_object().ok_or_else(|| ToolError::InvalidArgs("each decision must be an object".into()))?;
+            if fields.keys().any(|key| !matches!(key.as_str(), "rule" | "decision" | "page" | "note")) {
+                return Err(ToolError::InvalidArgs("unknown decision property".into()));
+            }
+            let rule = row["rule"].as_str().and_then(Rule::from_id).ok_or_else(|| ToolError::InvalidArgs("decision has an unknown rule".into()))?;
+            let decision = row["decision"].as_str().ok_or_else(|| ToolError::InvalidArgs("decision status is required".into()))?;
+            if !matches!(decision, "accepted" | "needs_work" | "skipped") {
+                return Err(ToolError::InvalidArgs("decision must be accepted, needs_work or skipped".into()));
+            }
+            let page = match row.get("page").filter(|value| !value.is_null()) {
+                Some(value) => {
+                    let page = value.as_u64().ok_or_else(|| ToolError::InvalidArgs("decision page must be positive".into()))?;
+                    if page == 0 || page > pages as u64 {
+                        return Err(ToolError::InvalidArgs("decision page is outside the document".into()));
+                    }
+                    Some(page)
+                }
+                None => None,
+            };
+            let note = match row.get("note").filter(|value| !value.is_null()) {
+                Some(value) => {
+                    let note = value.as_str().ok_or_else(|| ToolError::InvalidArgs("decision note must be text".into()))?;
+                    if note.len() > 4096 {
+                        return Err(ToolError::InvalidArgs("decision note exceeds 4096 bytes".into()));
+                    }
+                    Some(note)
+                }
+                None => None,
+            };
+            if !seen.insert((rule.id(), page)) {
+                return Err(ToolError::InvalidArgs("duplicate decision for a rule and page".into()));
+            }
+            Ok(json!({ "rule": rule.id(), "decision": decision, "page": page, "note": note }))
+        })
+        .collect()
+}
+
+/// A review sidecar is a few KiB of JSON; anything larger is not one.
+const MAX_REVIEW_SIDECAR_BYTES: u64 = 1 << 20;
+
+/// Read a review sidecar without trusting its size: the path is the caller's
+/// and may name any file, so the read stops past `MAX_REVIEW_SIDECAR_BYTES` and
+/// an oversized file is refused as not being a sidecar.
+fn read_review_sidecar(path: &std::path::Path) -> Result<Vec<u8>> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path).and_then(|file| file.take(MAX_REVIEW_SIDECAR_BYTES.saturating_add(1)).read_to_end(&mut bytes)).map_err(failed)?;
+    if bytes.len() as u64 > MAX_REVIEW_SIDECAR_BYTES {
+        return Err(failed("file is not an accessibility review sidecar"));
+    }
+    Ok(bytes)
+}
+
+fn parse_review_sidecar(bytes: &[u8]) -> Result<Value> {
+    let value: Value = serde_json::from_slice(bytes).map_err(|_| failed("file is not an accessibility review sidecar"))?;
+    let hash = value["sha256"].as_str().ok_or_else(|| failed("review sidecar has no document hash"))?;
+    let Some(pages) = value["pages"].as_u64().and_then(|n| usize::try_from(n).ok()).filter(|n| *n > 0) else {
+        return Err(failed("unsupported or invalid accessibility review sidecar"));
+    };
+    if value["schema"] != 1 || hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(failed("unsupported or invalid accessibility review sidecar"));
+    }
+    review_decisions(&value["decisions"], pages).map_err(failed)?;
+    Ok(value)
 }
 
 fn html_escape(value: &str) -> String {
@@ -127,6 +203,29 @@ fn review_html(record: &Value) -> Result<String> {
 }
 
 impl Automation {
+    pub(crate) fn accessibility_autotag_preview(&self, a: &Args) -> Result<Value> {
+        let page = self.page(a)?;
+        let preview = self.doc(a)?.autotag_preview(page).map_err(failed)?;
+        let candidates: Vec<Value> = preview
+            .candidates
+            .into_iter()
+            .map(|c| {
+                json!({
+                    "type": c.kind, "reason": c.reason, "text": c.text,
+                    "text_truncated": c.text_truncated, "bbox_user_space": c.rect,
+                    "font_size": c.size, "bold": c.bold, "needs_review": true,
+                })
+            })
+            .collect();
+        Ok(json!({
+            "page": page + 1, "candidates": candidates,
+            "unclassified_images": preview.unclassified_images,
+            "unclassified_text_blocks": preview.unclassified_text_blocks,
+            "existing_structure": preview.existing_structure,
+            "note": "Text roles are proposals only. Review images, tables, lists, annotations and existing tags before applying structure.",
+        }))
+    }
+
     fn a11y_options(&self, a: &Args) -> Result<Options> {
         let mut o = Options::default();
         if a.opt_bool("all")?.unwrap_or(false) {
@@ -252,6 +351,35 @@ impl Automation {
         Ok(json!({ "path": path.to_string_lossy(), "record": record }))
     }
 
+    pub(crate) fn a11y_review_save(&self, a: &Args) -> Result<Value> {
+        let doc = self.doc(a)?;
+        let decisions = review_decisions(a.get("decisions").ok_or_else(|| Args::missing("decisions"))?, doc.info.pages.len())?;
+        let hash = review_hash(doc.bytes.as_slice());
+        let path = self.resolve(a.str("path")?, true)?;
+        if path.exists() {
+            let prior = read_review_sidecar(&path)?;
+            let prior = parse_review_sidecar(&prior)?;
+            if prior["sha256"] != hash && !a.opt_bool("replace")?.unwrap_or(false) {
+                return Err(failed("review sidecar belongs to a different PDF revision; pass replace: true to replace it"));
+            }
+        }
+        let (y, m, d) = self.session.today();
+        let sidecar =
+            json!({ "schema": 1, "date": format!("{y}-{m:02}-{d:02}"), "sha256": hash, "pages": doc.info.pages.len(), "decisions": decisions });
+        write_atomic(&path, &serde_json::to_vec_pretty(&sidecar).map_err(failed)?)?;
+        Ok(json!({ "path": path.to_string_lossy(), "review": sidecar }))
+    }
+
+    pub(crate) fn a11y_review_load(&self, a: &Args) -> Result<Value> {
+        let doc = self.doc(a)?;
+        let path = self.resolve(a.str("path")?, false)?;
+        let review = parse_review_sidecar(&read_review_sidecar(&path)?)?;
+        if review["sha256"] != review_hash(doc.bytes.as_slice()) {
+            return Err(failed("review sidecar belongs to a different PDF revision"));
+        }
+        Ok(json!({ "path": path.to_string_lossy(), "review": review }))
+    }
+
     pub(crate) fn a11y_review_html(&self, a: &Args) -> Result<Value> {
         let record = self.review_record_value(a)?;
         let html = review_html(&record)?;
@@ -311,6 +439,7 @@ impl Automation {
             .map(|t| {
                 json!({
                     "object": t.object.num, "generation": t.object.generation, "type": t.kind,
+                    "parent": t.parent.map(|p| json!({ "object": p.num, "generation": p.generation })), "depth": t.depth,
                     "title": t.title, "actual_text": t.actual_text, "alternate_text": t.alt,
                     "language": t.language, "page": t.page.map(|p| p + 1),
                 })
@@ -520,6 +649,56 @@ impl Automation {
             "compliant": issues.is_empty(),
             "issues": issues,
             "declared": { "pdfa": d.pdfa.map(|(p, c)| format!("PDF/A-{p}{}", c.to_lowercase())), "pdfua": d.pdfua, "output_intents": d.output_intents },
+        }))
+    }
+
+    pub(crate) fn print_readiness(&self, a: &Args) -> Result<Value> {
+        let report = self.doc(a)?.print_readiness();
+        let findings: Vec<Value> =
+            report.findings.iter().map(|f| json!({ "id": f.id, "severity": f.severity, "message": f.message, "page": f.page })).collect();
+        let pages: Vec<Value> = report
+            .pages
+            .iter()
+            .map(|p| {
+                json!({
+                    "page": p.page,
+                    "media_mm": p.media_mm,
+                    "crop_mm": p.crop_mm,
+                    "trim_mm": p.trim_mm,
+                    "bleed_mm": p.bleed_mm,
+                    "trim_set": p.trim_set,
+                    "bleed_set": p.bleed_set,
+                    "bleed_margin_mm": p.bleed_margin_mm,
+                })
+            })
+            .collect();
+        let images: Vec<Value> = report
+            .images
+            .iter()
+            .map(|image| {
+                json!({
+                    "page": image.page,
+                    "name": image.name,
+                    "ppi": image.ppi,
+                    "pixels": image.pixels,
+                    "size_mm": image.size_mm,
+                })
+            })
+            .collect();
+        let pdfa: Vec<Value> = report
+            .pdfa_issues
+            .iter()
+            .map(|issue| json!({ "clause": issue.clause, "message": issue.message, "page": issue.page.map(|p| p + 1) }))
+            .collect();
+        Ok(json!({
+            "text": report.text(),
+            "findings": findings,
+            "pages": pages,
+            "images": images,
+            "output_intents": report.output_intents,
+            "fonts_not_embedded": report.fonts_not_embedded,
+            "pdfa_issues": pdfa,
+            "resolution_unknown": report.resolution_unknown,
         }))
     }
 
